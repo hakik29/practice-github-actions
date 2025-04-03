@@ -1,0 +1,89 @@
+name: Compile Marp Slides and Upload PDFs
+
+on:
+  pull_request:
+    paths:
+      - 'data/slides/*.md'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. リポジトリのソースをチェックアウト
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 2. Node.js のセットアップ（Marp CLI のため）
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+
+      # 3. Marp CLI のインストール
+      - name: Install Marp CLI
+        run: npm install -g @marp-team/marp-cli
+
+      # 4. 変更された Markdown ファイルをフィルタリング
+      - name: Filter changed Markdown files
+        id: filter
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            slides:
+              - 'data/slides/*.md'
+
+      # 5. 変更された各 Markdown ファイルを Marp で PDF に変換
+      - name: Compile Markdown to PDF
+        if: steps.filter.outputs.slides != ''
+        run: |
+          echo "Changed files: ${{ steps.filter.outputs.slides }}"
+          IFS=',' read -ra FILES <<< "${{ steps.filter.outputs.slides }}"
+          for file in "${FILES[@]}"; do
+            [ -z "$file" ] && continue
+            echo "Compiling $file..."
+            # 変換後の PDF は同じディレクトリに同名 (拡張子のみ .pdf) で出力
+            marp "$file" --pdf --allow-local-files -o "${file%.md}.pdf"
+          done
+
+      # 6. rclone をセットアップ（Google Drive へのアップロード用）
+      - name: Setup rclone
+        uses: qeesung/rclone-action@v7
+        with:
+          args: version
+        env:
+          # GitHub Secrets に設定した rclone の設定ファイル全体を指定
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      # 7. 生成された PDF を Google Drive の指定フォルダ（共有ドライブ）へアップロード
+      - name: Upload PDFs to Google Drive
+        run: |
+          for pdf in $(find data/slides -name '*.pdf'); do
+            echo "Uploading $pdf..."
+            rclone copy "$pdf" "elith-edu:E_License/slides" --drive-shared-with-me --drive-root-folder-id ${{ secrets.GDRIVE_FOLDER_ID }}
+          done
+
+      # 8. アップロードした各 PDF のファイルIDから共有リンクを生成
+      - name: Generate PDF Links
+        id: generate_links
+        run: |
+          LINKS=""
+          for pdf in $(find data/slides -name '*.pdf'); do
+            BASENAME=$(basename "$pdf")
+            # rclone の lsjson で対象フォルダ内のファイル情報を取得し、ファイル名で絞り込み
+            FILEINFO=$(rclone lsjson "elith-edu:E_License/slides" --drive-shared-with-me --drive-root-folder-id ${{ secrets.GDRIVE_FOLDER_ID }} | jq -r --arg name "$BASENAME" '.[] | select(.Name == $name)')
+            FILEID=$(echo "$FILEINFO" | jq -r '.ID')
+            if [ -n "$FILEID" ]; then
+              LINKS="$LINKS\n- [$BASENAME](https://drive.google.com/file/d/$FILEID/view?usp=sharing)"
+            fi
+          done
+          echo "links=$LINKS" >> $GITHUB_OUTPUT
+
+      # 9. Pull Request にアップロードした PDF へのリンクをコメントで返信
+      - name: Comment on Pull Request with PDF Links
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### コンパイルされた PDF ファイルが Google Drive にアップロードされました
+            以下のリンクからファイルをご確認ください:
+            ${{ steps.generate_links.outputs.links }}
